@@ -42,6 +42,8 @@ import org.keycloak.representations.adapters.config.PolicyEnforcerConfig.MethodC
 import org.keycloak.representations.adapters.config.PolicyEnforcerConfig.PathConfig;
 import org.keycloak.representations.adapters.config.PolicyEnforcerConfig.ScopeEnforcementMode;
 import org.keycloak.representations.idm.authorization.Permission;
+import org.keycloak.representations.idm.authorization.ResourceRepresentation;
+import org.keycloak.representations.idm.authorization.ScopeRepresentation;
 
 /**
  * @author <a href="mailto:psilva@redhat.com">Pedro Igor</a>
@@ -57,7 +59,7 @@ public abstract class AbstractPolicyEnforcer {
         this.policyEnforcer = policyEnforcer;
     }
 
-    public AuthorizationContext authorize(OIDCHttpFacade httpFacade) {
+    public AuthorizationContext authorize(OIDCHttpFacade httpFacade , Map<String, ResourceRepresentation> permissions) {
         EnforcementMode enforcementMode = getEnforcerConfig().getEnforcementMode();
 
         if (EnforcementMode.DISABLED.equals(enforcementMode)) {
@@ -74,7 +76,7 @@ public abstract class AbstractPolicyEnforcer {
                     if (EnforcementMode.DISABLED.equals(pathConfig.getEnforcementMode())) {
                         return createEmptyAuthorizationContext(true);
                     } else {
-                        challenge(pathConfig, getRequiredScopes(pathConfig, request), httpFacade);
+                        challenge(pathConfig, getRequiredScopes(pathConfig, request), httpFacade, permissions);
                     }
                 } else {
                     handleAccessDenied(httpFacade);
@@ -92,7 +94,14 @@ public abstract class AbstractPolicyEnforcer {
 
             if (pathConfig == null) {
                 if (EnforcementMode.PERMISSIVE.equals(enforcementMode)) {
-                    return createAuthorizationContext(accessToken, null);
+                    if (EnforcementMode.PERMISSIVE.equals(enforcementMode)) {
+                        if (permissions.isEmpty()) {
+                            return createAuthorizationContext(accessToken, null, httpFacade);
+                        } else {
+                            if (isAuthorized(null, null, accessToken, httpFacade, Collections.<String, List<String>>emptyMap(), permissions))
+                                return createAuthorizationContext(accessToken, null, httpFacade);
+                        }
+                    }
                 }
 
                 if (LOGGER.isDebugEnabled()) {
@@ -100,7 +109,7 @@ public abstract class AbstractPolicyEnforcer {
                 }
 
                 if (isDefaultAccessDeniedUri(request)) {
-                    return createAuthorizationContext(accessToken, null);
+                    return createAuthorizationContext(accessToken, null, httpFacade);
                 }
 
                 handleAccessDenied(httpFacade);
@@ -109,15 +118,15 @@ public abstract class AbstractPolicyEnforcer {
             }
 
             if (EnforcementMode.DISABLED.equals(pathConfig.getEnforcementMode())) {
-                return createAuthorizationContext(accessToken, pathConfig);
+                return createAuthorizationContext(accessToken, pathConfig, httpFacade);
             }
 
             MethodConfig methodConfig = getRequiredScopes(pathConfig, request);
             Map<String, List<String>> claims = resolveClaims(pathConfig, httpFacade);
 
-            if (isAuthorized(pathConfig, methodConfig, accessToken, httpFacade, claims)) {
+            if (isAuthorized(pathConfig, methodConfig, accessToken, httpFacade, claims, permissions)) {
                 try {
-                    return createAuthorizationContext(accessToken, pathConfig);
+                    return createAuthorizationContext(accessToken, pathConfig, httpFacade);
                 } catch (Exception e) {
                     throw new RuntimeException("Error processing path [" + pathConfig.getPath() + "].", e);
                 }
@@ -131,7 +140,7 @@ public abstract class AbstractPolicyEnforcer {
                 LOGGER.debugf("Sending challenge to the client. Path [%s]", pathConfig);
             }
 
-            if (!challenge(pathConfig, methodConfig, httpFacade)) {
+            if (!challenge(pathConfig, methodConfig, httpFacade, permissions)) {
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debugf("Challenge not sent, sending default forbidden response. Path [%s]", pathConfig);
                 }
@@ -142,9 +151,9 @@ public abstract class AbstractPolicyEnforcer {
         return createEmptyAuthorizationContext(false);
     }
 
-    protected abstract boolean challenge(PathConfig pathConfig, MethodConfig methodConfig, OIDCHttpFacade facade);
+    protected abstract boolean challenge(PathConfig pathConfig, MethodConfig methodConfig, OIDCHttpFacade facade, Map<String, ResourceRepresentation> permissions);
 
-    protected boolean isAuthorized(PathConfig actualPathConfig, MethodConfig methodConfig, AccessToken accessToken, OIDCHttpFacade httpFacade, Map<String, List<String>> claims) {
+    protected boolean isAuthorized(PathConfig actualPathConfig, MethodConfig methodConfig, AccessToken accessToken, OIDCHttpFacade httpFacade, Map<String, List<String>> claims, Map<String, ResourceRepresentation> permissions) {
         Request request = httpFacade.getRequest();
 
         if (isDefaultAccessDeniedUri(request)) {
@@ -159,6 +168,33 @@ public abstract class AbstractPolicyEnforcer {
 
         boolean hasPermission = false;
         Collection<Permission> grantedPermissions = authorization.getPermissions();
+
+        if(!permissions.isEmpty()){
+            Map<String, Permission> grantedPermissionMap = new HashMap();
+            for (Permission permission : grantedPermissions) {
+                grantedPermissionMap.put(permission.getResourceId(), permission);
+            }
+            for (Map.Entry<String,ResourceRepresentation > resource : permissions.entrySet()){
+                if (!grantedPermissionMap.containsKey(resource.getKey()))
+                    return false;
+
+                List<String> requiredscopes = new ArrayList<>();
+                for(ScopeRepresentation sc : resource.getValue().getScopes()){
+                    requiredscopes.add(sc.getName());
+                }
+
+                MethodConfig mConfig = new MethodConfig();
+                mConfig.setScopes(requiredscopes);
+
+                if (hasResourceScopePermission(mConfig,grantedPermissionMap.get(resource.getKey()))) {
+                    if (HTTP_METHOD_DELETE.equalsIgnoreCase(request.getMethod())) {
+                        getPolicyEnforcer().getPathMatcher().removeFromCache(request.getRelativePath());
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
 
         for (Permission permission : grantedPermissions) {
             if (permission.getResourceId() != null) {
@@ -324,8 +360,9 @@ public abstract class AbstractPolicyEnforcer {
         return methodConfig;
     }
 
-    private AuthorizationContext createAuthorizationContext(AccessToken accessToken, PathConfig pathConfig) {
-        return new ClientAuthorizationContext(accessToken, pathConfig, getAuthzClient());
+    private AuthorizationContext createAuthorizationContext(AccessToken accessToken, PathConfig pathConfig,
+                                                            OIDCHttpFacade httpFacade) {
+        return new AdapterAuthorizationContext(accessToken, pathConfig, getAuthzClient(), policyEnforcer, httpFacade);
     }
 
     private boolean isResourcePermission(PathConfig actualPathConfig, Permission permission) {
